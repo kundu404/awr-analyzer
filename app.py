@@ -44,9 +44,7 @@ with st.container():
 if uploaded_file is not None:
     html_text = uploaded_file.read().decode("utf-8")
     
-    # Debugging: Allow viewing raw HTML
-    with st.expander("🔍 View Raw AWR Report", expanded=False):
-        st.code(html_text[:5000] + "\n\n... [truncated] ...", language='html')
+    
 
     # Extract and show metrics
     with st.expander("📈 Extracted Metrics", expanded=True):
@@ -96,9 +94,7 @@ if uploaded_file is not None:
         if idle_match:
             st.write(f"Matched Value: {idle_match.group(1)}")
         
-        # Show sample of AWR content
-        st.subheader("AWR Content Sample")
-        st.text(html_text[:2000] + "\n\n... [truncated] ...")
+       
 
     # Charts
     with st.container():
