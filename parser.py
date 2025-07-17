@@ -1,117 +1,142 @@
-def generate_recommendations(metrics):
-    recs = []
+from bs4 import BeautifulSoup
+import re
+from datetime import datetime
 
-    # Database efficiency metrics
-    if metrics.get('buffer_cache_hit_ratio', 100) < 90:
-        recs.append("🔧 Low buffer cache hit ratio. Increase DB_CACHE_SIZE.")
-
-    if metrics.get('parse_calls', 0) > 300:
-        recs.append("🔧 High parse calls. Enable cursor sharing and bind variables.")
-
-    if metrics.get('library_hit_pct', 100) < 95:
-        recs.append("🔧 Low library cache efficiency. Tune shared pool size or reduce parsing.")
-
-    if metrics.get('soft_parse_pct', 100) < 90:
-        recs.append("🔧 Low soft parse ratio. Optimize application to use bind variables.")
+def extract_metrics(html_text):
+    soup = BeautifulSoup(html_text, 'html.parser')
+    metrics = {}
     
-    if metrics.get('hard_parses', 0) > 100:
-        recs.append("🔧 Excessive hard parsing. Check bind variables or use CURSOR_SHARING=FORCE.")
+    # 1. Extract snapshot duration from 'Begin Snap:' and 'End Snap:' rows
+    snap_begin = None
+    snap_end = None
+    for row in soup.find_all('tr'):
+        cells = row.find_all('td')
+        if len(cells) >= 3:
+            label = cells[0].get_text(strip=True)
+            if label.startswith('Begin Snap:'):
+                snap_begin = cells[2].get_text(strip=True)
+            elif label.startswith('End Snap:'):
+                snap_end = cells[2].get_text(strip=True)
+        if snap_begin and snap_end:
+            break
 
-    # Memory metrics
-    if metrics.get('shared_pool_free_percent', 100) < 10:
-        recs.append("🔧 Low free space in shared pool. Consider increasing SHARED_POOL_SIZE.")
-
-    if metrics.get('memory_usage_pct', 0) > 90:
-        recs.append("🔧 High memory usage. Investigate memory-intensive processes.")
+    snap_duration = 1800  # default to 30 minutes
+    if snap_begin and snap_end:
+        # Example format: 16-Jan-25 11:30:26
+        try:
+            start_time = datetime.strptime(snap_begin, "%d-%b-%y %H:%M:%S")
+            end_time = datetime.strptime(snap_end, "%d-%b-%y %H:%M:%S")
+            snap_duration = (end_time - start_time).total_seconds()
+            if snap_duration < 0:
+                # Handle day wrap (if end is after midnight)
+                snap_duration += 86400
+            metrics['snap_duration_seconds'] = snap_duration
+        except Exception as e:
+            pass
     
-    if metrics.get('pga_cache_hit_percent', 100) < 60:
-        recs.append("🔧 Low PGA cache hit. Increase PGA_AGGREGATE_TARGET.")
-
-    # I/O metrics
-    if metrics.get('physical_reads', 0) > 10000:
-        recs.append("🔧 High physical reads. Investigate inefficient SQL or missing indexes.")
-
-    if metrics.get('physical_writes', 0) > 10000:
-        recs.append("🔧 High physical writes. Optimize write operations and checkpointing.")
+    # 2. Extract CPU cores from host info table (CPUs column)
+    cpu_cores = 1
+    found_host_table = False
+    for table in soup.find_all('table'):
+        headers = [th.get_text(strip=True) for th in table.find_all('th')]
+        if 'CPUs' in headers and 'Cores' in headers:
+            for row in table.find_all('tr'):
+                cells = row.find_all('td')
+                if len(cells) >= 3:
+                    try:
+                        cpus_val = cells[2].get_text(strip=True)
+                        if cpus_val:
+                            cpu_cores = int(cpus_val)
+                            metrics['cpu_cores'] = cpu_cores
+                            found_host_table = True
+                            break
+                    except Exception:
+                        continue
+        if found_host_table:
+            break
+    # Fallback: regex if table not found
+    if not found_host_table:
+        cpu_pattern = re.compile(r"CPUs:\s*(\d+)")
+        cpu_match = cpu_pattern.search(html_text)
+        if cpu_match:
+            try:
+                cpu_cores = int(cpu_match.group(1))
+                metrics['cpu_cores'] = cpu_cores
+            except:
+                pass
     
-    if metrics.get('redo_size_bytes', 0) > 10000000:  # 10 MB
-        recs.append("🔧 High redo generation. Investigate frequent DMLs or logging overhead.")
+    # 3. Extract metrics from tables
+    for row in soup.find_all('tr'):
+        cells = row.find_all('td')
+        if len(cells) >= 2:
+            label = cells[0].get_text(strip=True)
+            value = cells[1].get_text(strip=True).replace(',', '')
 
-    # CPU and timing metrics
-    if metrics.get('cpu_utilization_pct', 0) > 80:
-        recs.append("🔧 High CPU usage. Identify CPU-intensive SQL or processes.")
+            try:
+                # Handle percentage values
+                if '%' in value:
+                    value = float(value.replace('%', ''))
+                # Handle large numbers with suffixes
+                elif value.upper().endswith('K'):
+                    value = float(value.upper().replace('K', '')) * 1000
+                elif value.upper().endswith('M'):
+                    value = float(value.upper().replace('M', '')) * 1_000_000
+                elif value.upper().endswith('G'):
+                    value = float(value.upper().replace('G', '')) * 1_000_000_000
+                else:
+                    value = float(value)
+                
+                # Map labels to metric names
+                metric_map = {
+                    'Buffer  Hit   %': 'buffer_cache_hit_ratio',
+                    'Library Hit   %': 'library_hit_pct',
+                    'Memory Usage %': 'memory_usage_pct',
+                    'Physical read (blocks)': 'physical_reads',
+                    'Physical write (blocks)': 'physical_writes',
+                    'User calls': 'user_calls',
+                    'DB CPU': 'db_cpu_seconds',  # Changed to seconds
+                    '%Total CPU': 'cpu_utilization_pct',
+                    'CPU Utilization %': 'cpu_utilization_pct',
+                    'Parse Calls': 'parse_calls',
+                    'Redo size (bytes)': 'redo_size_bytes',
+                    'Logical read (blocks)': 'logical_reads',
+                    'Hard parses (SQL)': 'hard_parses',
+                    'Soft Parse %': 'soft_parse_pct',
+                    'Latch Hit %': 'latch_hit_pct',
+                    'SQL Work Area (MB)': 'sql_work_area_mb',
+                    'Executions': 'executions',
+                    'Logons:': 'logons',
+                    '%Idle': 'cpu_idle_pct'
+                }
+                
+                # Assign value to metric if label matches
+                for pattern, metric_name in metric_map.items():
+                    if pattern in label:
+                        metrics[metric_name] = value
+                        break
 
-    if metrics.get('db_time_ratio', 0) > 90:
-        recs.append("🔧 High DB Time. Investigate top wait events and SQLs.")
+            except ValueError:
+                continue
+    
+    # 4. Calculate real CPU utilization
+    db_cpu_seconds = metrics.get('db_cpu_seconds', 0)
+    cpu_idle_pct = metrics.get('cpu_idle_pct', 100)
+    
+    # First try: Use idle percentage if available
+    if 'cpu_idle_pct' in metrics:
+        metrics['cpu_utilization_pct'] = 100 - cpu_idle_pct
+    # Second try: Calculate from DB CPU seconds
+    elif db_cpu_seconds > 0 and snap_duration > 0 and cpu_cores > 0:
+        # Utilization = (CPU seconds / duration) / cores * 100
+        utilization = (db_cpu_seconds / snap_duration) / cpu_cores * 100
+        metrics['cpu_utilization_pct'] = round(utilization, 2)
+    
+    return metrics
 
-    if metrics.get('sql_response_time', 0) > 1:
-        recs.append("🔧 Poor SQL response time. Check indexes and joins.")
 
-    # Concurrency and contention
-    if metrics.get('enqueue_waits', 0) > 0:
-        recs.append("🔧 Enqueue waits detected. Investigate object contention.")
-
-    if metrics.get('latch_misses', 0) > 100:
-        recs.append("🔧 High latch misses. Tune latch-related parameters or reduce contention.")
-
-    if metrics.get('log_file_sync', 0) > 10:
-        recs.append("🔧 High log file sync time. Check I/O performance or commit frequency.")
-
-    # Transaction metrics
-    if metrics.get('user_commits', 0) < metrics.get('user_rollbacks', 1):
-        recs.append("🔧 Rollbacks are more than commits. Investigate transaction failures.")
-
-    if metrics.get('transaction_count', 0) > 5000:
-        recs.append("🔧 High transaction volume. Consider batching operations.")
-
-    # SQL execution metrics
-    if metrics.get('full_table_scans', 0) > 1000:
-        recs.append("🔧 Many full table scans. Investigate missing indexes or rewrite queries.")
-
-    if metrics.get('top_sql_buffer_gets', 0) > 100000:
-        recs.append("🔧 SQL with high buffer gets. Tune expensive queries.")
-
-    if metrics.get('sorts_disk', 0) > 1000:
-        recs.append("🔧 High disk sorts. Increase SORT_AREA_SIZE or use temporary tablespaces.")
-
-    if metrics.get('memory_sort_percent', 100) < 80:
-        recs.append("🔧 Most sorts not in memory. Increase workarea_size_policy or PGA.")
-
-    # Storage and configuration
-    if metrics.get('db_files', 0) > 1000:
-        recs.append("🔧 Too many database files. Could affect startup time and file I/O.")
-
-    if metrics.get('log_switches', 0) > 30:
-        recs.append("🔧 Frequent log switches. Consider increasing log file size.")
-
-    if metrics.get('checkpoint_time', 0) > 5:
-        recs.append("🔧 Long checkpoints. Tune checkpoint parameters or log buffer.")
-
-    if metrics.get('log_file_parallel_write', 0) > 10:
-        recs.append("🔧 Slow log writes. Investigate redo log disk I/O.")
-
-    # Top wait events analysis
-    top_wait = metrics.get('top_wait_event', "")
-    if top_wait == "db file sequential read":
-        recs.append("🔧 Index reads dominating. Investigate slow I/O on indexed reads.")
-    elif top_wait == "db file scattered read":
-        recs.append("🔧 Full table scans common. Check missing indexes.")
-    elif top_wait == "log file sync":
-        recs.append("🔧 COMMIT frequency too high. Use batch processing.")
-    elif top_wait == "buffer busy waits":
-        recs.append("🔧 Buffer contention. Tune hot blocks or increase freelists.")
-    elif top_wait == "enq: TX - row lock contention":
-        recs.append("🔧 Row lock contention. Optimize transaction design and commit frequency.")
-
-    # Connection metrics
-    if metrics.get('logons', 0) > 100:
-        recs.append("🔧 High connection rate. Implement connection pooling.")
-
-    if metrics.get('session_count', 0) > 500:
-        recs.append("🔧 High session count. Review connection management and pooling.")
-
-    # If no issues found
-    if not recs:
-        recs.append("✅ No critical performance issues detected.")
-
-    return recs
+def extract_top_sql(html_text):
+    """
+    Placeholder for extracting top SQL statements from AWR HTML.
+    Returns an empty list. Implement actual logic as needed.
+    """
+    return []
