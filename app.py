@@ -45,7 +45,7 @@ if uploaded_file is not None:
     html_text = uploaded_file.read().decode("utf-8")
     
     # Debugging: Allow viewing raw HTML
-    with st.expander("🔍 View Raw HTML", expanded=False):
+    with st.expander("🔍 View Raw AWR Report", expanded=False):
         st.code(html_text[:5000] + "\n\n... [truncated] ...", language='html')
 
     # Extract and show metrics
